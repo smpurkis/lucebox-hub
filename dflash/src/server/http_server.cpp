@@ -282,26 +282,51 @@ bool HttpServer::route_request(int fd, const HttpRequest & hr) {
             chat_msgs.push_back({"user", req.messages.get<std::string>()});
         }
 
-        std::string rendered = render_chat_template(chat_msgs, chat_format_, true);
+        // Determine thinking mode BEFORE rendering so the template can inject
+        // the <think>\n\n</think>\n\n block when thinking is disabled.
+        // Default: thinking OFF (matches server.py — Qwen3.6 thinking wrecks
+        // DFlash acceptance rates; clients opt in explicitly).
+        bool enable_thinking = false;
+
+        // OpenAI Responses API: "reasoning" field
+        if (body.contains("reasoning")) {
+            auto & r = body["reasoning"];
+            if (r.contains("effort")) {
+                std::string effort = r.value("effort", "low");
+                enable_thinking = (effort != "low");
+            } else {
+                enable_thinking = true;
+            }
+        }
+        // Anthropic: "thinking" field
+        if (body.contains("thinking")) {
+            auto & th = body["thinking"];
+            if (th.contains("type")) {
+                enable_thinking = (th.value("type", "") == "enabled");
+            }
+        }
+        // Direct: chat_template_kwargs.enable_thinking
+        if (body.contains("chat_template_kwargs")) {
+            auto & kwargs = body["chat_template_kwargs"];
+            if (kwargs.contains("enable_thinking")) {
+                enable_thinking = kwargs["enable_thinking"].get<bool>();
+            }
+        }
+
+        req.thinking_enabled = enable_thinking;
+
+        std::string rendered = render_chat_template(chat_msgs, chat_format_,
+                                                    true, enable_thinking);
         req.prompt_tokens = tokenizer_.encode(rendered);
 
         // Detect if prompt ends with <think> (model will start in reasoning mode).
-        {
-            // Check if rendered prompt ends with "<think>" + optional whitespace
+        if (enable_thinking) {
             size_t end = rendered.size();
             while (end > 0 && (rendered[end-1] == ' ' || rendered[end-1] == '\n' ||
                    rendered[end-1] == '\r' || rendered[end-1] == '\t'))
                 end--;
             if (end >= 7 && rendered.compare(end - 7, 7, "<think>") == 0) {
                 req.started_in_thinking = true;
-            }
-        }
-
-        // Parse thinking_enabled from chat_template_kwargs.
-        if (body.contains("chat_template_kwargs")) {
-            auto & kwargs = body["chat_template_kwargs"];
-            if (kwargs.contains("enable_thinking")) {
-                req.thinking_enabled = kwargs["enable_thinking"].get<bool>();
             }
         }
 

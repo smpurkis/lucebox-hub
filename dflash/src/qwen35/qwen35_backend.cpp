@@ -579,7 +579,11 @@ int Qwen35Backend::do_prefill(const std::vector<int32_t> & tokens,
     return committed;
 }
 
-// ── AR decode fallback (no draft model) ─────────────────────────────────
+bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
+                                    std::vector<int32_t> & out_tokens,
+                                    const DaemonIO & io) {
+    // TODO: Migrate the speculative decode loop from test_dflash.cpp.
+    // For now, fall back to simple autoregressive decode (no draft).
 
 bool Qwen35Backend::do_ar_decode(int committed, int n_gen,
                                   std::vector<int32_t> & out_tokens,
@@ -590,7 +594,37 @@ bool Qwen35Backend::do_ar_decode(int committed, int n_gen,
     std::vector<float> embed_buf_vec(hidden);
     float * embed_buf = embed_buf_vec.data();
 
-    for (int i = 0; i < n_gen; i++) {
+    // First token: sample from the prefill's last-position logits (already
+    // computed by do_prefill's final ggml_backend_graph_compute).
+    // The last chunk used last_token_logits_only=false, so sg_.logits holds
+    // logits for ALL positions in that chunk.  We need the LAST position.
+    {
+        const int PREFILL_UBATCH = 512;
+        int n_last_chunk = committed % PREFILL_UBATCH;
+        if (n_last_chunk == 0) n_last_chunk = PREFILL_UBATCH;
+        const size_t last_pos_offset = (size_t)(n_last_chunk - 1) * vocab * sizeof(float);
+        ggml_backend_tensor_get(sg_.logits, logits_buf.data(), last_pos_offset,
+                                sizeof(float) * vocab);
+        int32_t first_tok;
+        if (sampler_.temp > 0) {
+            first_tok = sample_logits(logits_buf.data(), vocab, sampler_,
+                                      out_tokens, sampler_rng_);
+        } else {
+            first_tok = 0;
+            float best = logits_buf[0];
+            for (int j = 1; j < vocab; j++) {
+                if (logits_buf[j] > best) { best = logits_buf[j]; first_tok = j; }
+            }
+        }
+        out_tokens.push_back(first_tok);
+        io.emit(first_tok);
+        if (IS_EOS_TOK(first_tok, w_)) { io.emit(-1); return true; }
+        committed++;
+        cache_.cur_pos = committed;
+    }
+
+    // AR decode loop for remaining tokens
+    for (int i = 1; i < n_gen; i++) {
         int32_t tok = out_tokens.back();
 
         if (!w_.embedder.embed(&tok, 1, embed_buf)) return false;

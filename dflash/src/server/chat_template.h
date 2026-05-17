@@ -31,10 +31,15 @@ enum class ChatFormat {
 //
 // If `add_generation_prompt` is true, appends the assistant turn prefix
 // at the end (so the model starts generating as assistant).
+//
+// `enable_thinking` controls Qwen3/3.5 think mode:
+//   true  → assistant starts open-ended (model will produce <think>...</think>)
+//   false → assistant starts with <think>\n\n</think>\n\n (skip thinking)
 std::string render_chat_template(
     const std::vector<ChatMessage> & messages,
     ChatFormat format,
-    bool add_generation_prompt = true);
+    bool add_generation_prompt = true,
+    bool enable_thinking = false);
 
 // Detect the appropriate chat format for an architecture.
 ChatFormat chat_format_for_arch(const std::string & arch);

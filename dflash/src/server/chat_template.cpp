@@ -13,7 +13,8 @@ ChatFormat chat_format_for_arch(const std::string & arch) {
 std::string render_chat_template(
     const std::vector<ChatMessage> & messages,
     ChatFormat format,
-    bool add_generation_prompt)
+    bool add_generation_prompt,
+    bool enable_thinking)
 {
     std::string result;
 
@@ -32,6 +33,11 @@ std::string render_chat_template(
         }
         if (add_generation_prompt) {
             result += "<|im_start|>assistant\n";
+            if (!enable_thinking) {
+                // Qwen3 thinking disabled: inject closed think block so the
+                // model skips reasoning and generates the answer directly.
+                result += "<think>\n\n</think>\n\n";
+            }
         }
         break;
     }
