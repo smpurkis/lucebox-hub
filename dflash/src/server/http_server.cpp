@@ -4,9 +4,11 @@
 // job queue, worker thread with SSE streaming and disconnect detection.
 
 #include "http_server.h"
+#include "sse_emitter.h"
 
 #include <algorithm>
 #include <cerrno>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 
@@ -206,9 +208,11 @@ bool HttpServer::route_request(int fd, const HttpRequest & hr) {
 
         if (hr.path == "/v1/chat/completions") {
             req.format = ApiFormat::OPENAI_CHAT;
+            req.response_id = generate_id("chatcmpl");
             req.messages = body["messages"];
         } else if (hr.path == "/v1/messages") {
             req.format = ApiFormat::ANTHROPIC;
+            req.response_id = generate_id("msg");
             req.messages = body["messages"];
             if (body.contains("system")) {
                 // Anthropic puts system as a top-level field.
@@ -240,13 +244,33 @@ bool HttpServer::route_request(int fd, const HttpRequest & hr) {
             for (const auto & m : req.messages) {
                 ChatMessage cm;
                 cm.role = m.value("role", "user");
-                if (m["content"].is_string()) {
-                    cm.content = m["content"].get<std::string>();
-                } else if (m["content"].is_array()) {
-                    // Multi-part content (text parts only for now).
-                    for (const auto & part : m["content"]) {
-                        if (part.value("type", "") == "text") {
-                            cm.content += part.value("text", "");
+
+                // Check for tool memory replay on assistant messages with tool_calls.
+                bool replayed = false;
+                if (cm.role == "assistant" && m.contains("tool_calls") &&
+                    m["tool_calls"].is_array() && !m["tool_calls"].empty()) {
+                    // Extract call IDs for tool memory lookup.
+                    std::vector<std::string> call_ids;
+                    for (const auto & tc : m["tool_calls"]) {
+                        std::string id = tc.value("id", "");
+                        if (!id.empty()) call_ids.push_back(id);
+                    }
+                    std::string raw = tool_memory_.lookup(call_ids);
+                    if (!raw.empty()) {
+                        cm.content = raw;
+                        replayed = true;
+                    }
+                }
+
+                if (!replayed) {
+                    if (m.contains("content") && m["content"].is_string()) {
+                        cm.content = m["content"].get<std::string>();
+                    } else if (m.contains("content") && m["content"].is_array()) {
+                        // Multi-part content (text parts only for now).
+                        for (const auto & part : m["content"]) {
+                            if (part.value("type", "") == "text") {
+                                cm.content += part.value("text", "");
+                            }
                         }
                     }
                 }
@@ -259,6 +283,26 @@ bool HttpServer::route_request(int fd, const HttpRequest & hr) {
 
         std::string rendered = render_chat_template(chat_msgs, chat_format_, true);
         req.prompt_tokens = tokenizer_.encode(rendered);
+
+        // Detect if prompt ends with <think> (model will start in reasoning mode).
+        {
+            // Check if rendered prompt ends with "<think>" + optional whitespace
+            size_t end = rendered.size();
+            while (end > 0 && (rendered[end-1] == ' ' || rendered[end-1] == '\n' ||
+                   rendered[end-1] == '\r' || rendered[end-1] == '\t'))
+                end--;
+            if (end >= 7 && rendered.compare(end - 7, 7, "<think>") == 0) {
+                req.started_in_thinking = true;
+            }
+        }
+
+        // Parse thinking_enabled from chat_template_kwargs.
+        if (body.contains("chat_template_kwargs")) {
+            auto & kwargs = body["chat_template_kwargs"];
+            if (kwargs.contains("enable_thinking")) {
+                req.thinking_enabled = kwargs["enable_thinking"].get<bool>();
+            }
+        }
 
     } catch (const std::exception & e) {
         send_error(fd, 400, std::string("JSON parse error: ") + e.what());
@@ -312,6 +356,23 @@ void HttpServer::worker_loop() {
             }
         }
 
+        // Create SSE emitter for streaming state machine.
+        SseEmitter emitter(req.format, req.response_id, req.model,
+                           (int)req.prompt_tokens.size(), req.tools,
+                           &tool_memory_, req.started_in_thinking);
+
+        // Emit initial SSE events.
+        if (req.stream) {
+            for (const auto & chunk : emitter.emit_start()) {
+                if (!send_all(fd, chunk.data(), chunk.size())) {
+                    std::lock_guard<std::mutex> lk(job->mu);
+                    job->done = true;
+                    job->cv.notify_one();
+                    continue;
+                }
+            }
+        }
+
         // Build generate request.
         GenerateRequest gen_req;
         gen_req.prompt = req.prompt_tokens;
@@ -324,47 +385,22 @@ void HttpServer::worker_loop() {
         DaemonIO io;
         io.stream_fd = -1;  // no pipe — we write SSE directly
 
-        std::string accumulated_text;
+        int completion_tokens = 0;
         bool client_disconnected = false;
 
         io.on_token = [&](int32_t token) -> bool {
             if (client_disconnected) return false;
+            completion_tokens++;
 
             std::string text = tokenizer_.token_text(token);
-            accumulated_text += text;
 
             if (req.stream && !text.empty()) {
-                // Format SSE chunk based on API format.
-                std::string chunk;
-                switch (req.format) {
-                case ApiFormat::OPENAI_CHAT: {
-                    json delta = {{"choices", json::array({{
-                        {"index", 0},
-                        {"delta", {{"content", text}}}
-                    }})}};
-                    chunk = delta.dump();
-                    break;
-                }
-                case ApiFormat::ANTHROPIC: {
-                    json event = {{"type", "content_block_delta"},
-                                  {"index", 0},
-                                  {"delta", {{"type", "text_delta"}, {"text", text}}}};
-                    chunk = event.dump();
-                    break;
-                }
-                case ApiFormat::RESPONSES: {
-                    json event = {{"type", "response.output_text.delta"},
-                                  {"delta", text}};
-                    chunk = event.dump();
-                    break;
-                }
-                default:
-                    chunk = text;
-                }
-
-                if (!send_sse_chunk(fd, chunk)) {
-                    client_disconnected = true;
-                    return false;  // abort generation
+                auto chunks = emitter.emit_token(text);
+                for (const auto & chunk : chunks) {
+                    if (!send_all(fd, chunk.data(), chunk.size())) {
+                        client_disconnected = true;
+                        return false;
+                    }
                 }
             }
             return true;
@@ -373,38 +409,110 @@ void HttpServer::worker_loop() {
         // Run generation.
         GenerateResult result = backend_.generate(gen_req, io);
 
-        // Send final SSE event.
+        // Finalize.
         if (req.stream && !client_disconnected) {
-            send_sse_chunk(fd, "[DONE]");
+            auto final_chunks = emitter.emit_finish(completion_tokens);
+            for (const auto & chunk : final_chunks) {
+                if (!send_all(fd, chunk.data(), chunk.size())) {
+                    client_disconnected = true;
+                    break;
+                }
+            }
         } else if (!req.stream && !client_disconnected) {
-            // Non-streaming: send complete JSON response.
+            // Non-streaming: build complete response using emitter state.
+            // Feed all tokens through emitter first.
+            for (int32_t tok : result.tokens) {
+                std::string text = tokenizer_.token_text(tok);
+                emitter.emit_token(text);
+            }
+            emitter.emit_finish((int)result.tokens.size());
+
             json resp;
             switch (req.format) {
-            case ApiFormat::OPENAI_CHAT:
-                resp = {{"choices", json::array({{
-                    {"index", 0},
-                    {"message", {{"role", "assistant"}, {"content", accumulated_text}}},
-                    {"finish_reason", result.ok ? "stop" : "error"}
-                }})}};
+            case ApiFormat::OPENAI_CHAT: {
+                json msg = {{"role", "assistant"}, {"content", emitter.accumulated_text()}};
+                if (!emitter.reasoning_text().empty()) {
+                    msg["reasoning_content"] = emitter.reasoning_text();
+                }
+                if (!emitter.tool_calls().empty()) {
+                    json tcs = json::array();
+                    for (const auto & tc : emitter.tool_calls()) {
+                        tcs.push_back({{"id", tc.id}, {"type", "function"},
+                                       {"function", {{"name", tc.name},
+                                                     {"arguments", tc.arguments}}}});
+                    }
+                    msg["tool_calls"] = tcs;
+                }
+                resp = {
+                    {"id", req.response_id},
+                    {"object", "chat.completion"},
+                    {"created", std::chrono::duration_cast<std::chrono::seconds>(
+                        std::chrono::system_clock::now().time_since_epoch()).count()},
+                    {"model", req.model},
+                    {"choices", json::array({{
+                        {"index", 0}, {"message", msg},
+                        {"finish_reason", emitter.finish_reason()}
+                    }})},
+                    {"usage", {
+                        {"prompt_tokens", (int)req.prompt_tokens.size()},
+                        {"completion_tokens", (int)result.tokens.size()},
+                        {"total_tokens", (int)(req.prompt_tokens.size() + result.tokens.size())}
+                    }}
+                };
                 break;
-            case ApiFormat::ANTHROPIC:
-                resp = {{"content", json::array({{
-                    {"type", "text"},
-                    {"text", accumulated_text}
-                }})}};
+            }
+            case ApiFormat::ANTHROPIC: {
+                json content = json::array();
+                if (!emitter.reasoning_text().empty()) {
+                    content.push_back({{"type", "thinking"}, {"thinking", emitter.reasoning_text()}});
+                }
+                content.push_back({{"type", "text"}, {"text", emitter.accumulated_text()}});
+                resp = {
+                    {"id", req.response_id}, {"type", "message"},
+                    {"role", "assistant"}, {"model", req.model},
+                    {"content", content},
+                    {"stop_reason", emitter.finish_reason() == "stop" ? "end_turn" : "tool_use"},
+                    {"usage", {
+                        {"input_tokens", (int)req.prompt_tokens.size()},
+                        {"output_tokens", (int)result.tokens.size()}
+                    }}
+                };
                 break;
-            case ApiFormat::RESPONSES:
-                resp = {{"id", req.response_id},
-                        {"output", json::array({{
-                            {"type", "message"},
-                            {"content", json::array({{
-                                {"type", "output_text"},
-                                {"text", accumulated_text}
-                            }})}
-                        }})}};
+            }
+            case ApiFormat::RESPONSES: {
+                json output = json::array();
+                if (!emitter.tool_calls().empty()) {
+                    for (const auto & tc : emitter.tool_calls()) {
+                        output.push_back({
+                            {"type", "function_call"}, {"id", tc.id},
+                            {"status", "completed"}, {"call_id", tc.id},
+                            {"name", tc.name}, {"arguments", tc.arguments}
+                        });
+                    }
+                } else {
+                    output.push_back({
+                        {"type", "message"}, {"id", req.response_id + "_msg"},
+                        {"status", "completed"}, {"role", "assistant"},
+                        {"content", json::array({{
+                            {"type", "output_text"}, {"text", emitter.accumulated_text()},
+                            {"annotations", json::array()}
+                        }})}
+                    });
+                }
+                resp = {
+                    {"id", req.response_id}, {"object", "response"},
+                    {"status", "completed"}, {"model", req.model},
+                    {"output", output},
+                    {"usage", {
+                        {"input_tokens", (int)req.prompt_tokens.size()},
+                        {"output_tokens", (int)result.tokens.size()},
+                        {"total_tokens", (int)(req.prompt_tokens.size() + result.tokens.size())}
+                    }}
+                };
                 break;
+            }
             default:
-                resp = {{"text", accumulated_text}};
+                resp = {{"text", emitter.accumulated_text()}};
             }
             // Set socket back to blocking for the final send.
             int flags = fcntl(fd, F_GETFL, 0);
@@ -414,8 +522,8 @@ void HttpServer::worker_loop() {
 
         if (client_disconnected) {
             std::fprintf(stderr, "[server] client disconnected — generation aborted "
-                         "(prompt=%zu out=%zu)\n",
-                         req.prompt_tokens.size(), result.tokens.size());
+                         "(prompt=%zu out=%d)\n",
+                         req.prompt_tokens.size(), completion_tokens);
         }
 
         // Signal client thread that we're done.

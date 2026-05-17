@@ -247,6 +247,10 @@ add_library(dflash27b STATIC
     # ── Server components (tokenizer, chat template) ──
     src/server/tokenizer.cpp
     src/server/chat_template.cpp
+    src/server/tool_parser.cpp
+    src/server/reasoning.cpp
+    src/server/tool_memory.cpp
+    src/server/sse_emitter.cpp
 )
 # BSA (Block-Sparse Attention) backs the speculative-prefill drafter scoring
 # path. Default ON so prefill is fast out of the box. Turn OFF if you don't

@@ -14,6 +14,8 @@
 #include "common/model_backend.h"
 #include "tokenizer.h"
 #include "chat_template.h"
+#include "tool_memory.h"
+#include "api_types.h"
 #include "third_party/nlohmann/json.hpp"
 
 #include <atomic>
@@ -44,7 +46,6 @@ struct ServerConfig {
 };
 
 // ─── Parsed request ─────────────────────────────────────────────────────
-enum class ApiFormat { OPENAI_CHAT, ANTHROPIC, RESPONSES, COMPLETIONS };
 
 struct ParsedRequest {
     ApiFormat                  format;
@@ -59,6 +60,9 @@ struct ParsedRequest {
     json                      messages;
     // Response ID
     std::string               response_id;
+    // Thinking/reasoning state
+    bool                      thinking_enabled = true;
+    bool                      started_in_thinking = false;
 };
 
 // ─── HTTP server ────────────────────────────────────────────────────────
@@ -116,6 +120,7 @@ private:
     Tokenizer &      tokenizer_;
     ServerConfig     config_;
     ChatFormat       chat_format_;
+    ToolMemory       tool_memory_;
 
     // Worker thread.
     std::thread                     worker_thread_;
