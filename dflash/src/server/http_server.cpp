@@ -373,8 +373,15 @@ bool HttpServer::route_request(int fd, const HttpRequest & hr) {
 
         req.thinking_enabled = enable_thinking;
 
+        // Serialize tools JSON for template injection.
+        std::string tools_json;
+        if (req.tools.is_array() && !req.tools.empty()) {
+            tools_json = req.tools.dump();
+        }
+
         std::string rendered = render_chat_template(chat_msgs, chat_format_,
-                                                    true, enable_thinking);
+                                                    true, enable_thinking,
+                                                    tools_json);
         req.prompt_tokens = tokenizer_.encode(rendered);
 
         // Detect if prompt ends with <think> (model will start in reasoning mode).

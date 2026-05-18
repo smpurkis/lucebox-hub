@@ -36,7 +36,7 @@ static void print_usage(const char * prog) {
         "  --gpu <N>            Target GPU device (default: 0)\n"
         "  --draft-gpu <N>      Draft GPU device (default: 0)\n"
         "  --chunk <N>          Chunked-prefill chunk size (default: 512)\n"
-        "  --fa-window <N>     Flash-attention sliding window (default: 2048, 0=full)\n"
+        "  --fa-window <N>     Flash-attention sliding window (default: 0=full)\n"
         "  --model-name <name>  Model name for /v1/models (default: dflash)\n"
         "  --ddtree             Enable DDTree speculative decode\n"
         "  --ddtree-budget <N>  DDTree budget (default: 64)\n"
