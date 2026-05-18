@@ -323,12 +323,16 @@ def main():
         )
 
     def _wrap_prompt(raw_prompt: str) -> str:
-        if not args.no_thinking:
+        # Instruct/thinking models require the chat template. Feeding a raw
+        # prompt makes the model ramble and never emit a scorable answer
+        # (issue #191: Math500 scored 0/10). Always apply the template when the
+        # tokenizer has one; --no-thinking only toggles Qwen's <think> block.
+        if not getattr(tok, "chat_template", None):
             return raw_prompt
         return tok.apply_chat_template(
             [{"role": "user", "content": raw_prompt}],
             tokenize=False, add_generation_prompt=True,
-            enable_thinking=False,
+            enable_thinking=not args.no_thinking,
         )
 
     results = {}
