@@ -106,6 +106,7 @@ private:
     struct HttpRequest {
         std::string method;
         std::string path;
+        std::string query;  // raw query string (after '?')
         std::string body;
     };
     bool read_http_request(int fd, HttpRequest & out);

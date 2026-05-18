@@ -163,12 +163,40 @@ void HttpServer::handle_client(int fd) {
 
     // Models endpoint.
     if (hr.method == "GET" && hr.path == "/v1/models") {
+        // Codex sends ?client_version= — serve the Codex-specific schema.
+        if (hr.query.find("client_version") != std::string::npos) {
+            json codex_models = {
+                {"models", json::array({
+                    {{"slug", config_.model_name},
+                     {"display_name", config_.model_name},
+                     {"description", "Local DFlash speculative-decoding server"},
+                     {"default_reasoning_level", "low"},
+                     {"supported_reasoning_levels", json::array({
+                         {{"effort", "low"}, {"description", "No thinking"}},
+                         {{"effort", "medium"}, {"description", "Thinking enabled"}},
+                     })},
+                     {"shell_type", "shell_command"},
+                     {"visibility", "list"},
+                     {"supported_in_api", true},
+                     {"priority", 1},
+                     {"context_window", config_.max_ctx},
+                     {"supports_reasoning_summaries", false},
+                     {"supports_parallel_tool_calls", false}}
+                })}
+            };
+            send_response(fd, 200, "application/json", codex_models.dump() + "\n");
+            ::close(fd);
+            return;
+        }
         json models = {
             {"object", "list"},
             {"data", json::array({
                 {{"id", config_.model_name},
                  {"object", "model"},
-                 {"owned_by", "dflash"}}
+                 {"owned_by", "dflash"},
+                 {"created", 1700000000},
+                 {"context_length", config_.max_ctx},
+                 {"max_context_length", config_.max_ctx}}
             })}
         };
         send_response(fd, 200, "application/json", models.dump() + "\n");
@@ -193,7 +221,7 @@ bool HttpServer::route_request(int fd, const HttpRequest & hr) {
         json body = json::parse(hr.body);
 
         // Common fields.
-        req.stream = body.value("stream", true);
+        req.stream = body.value("stream", false);
         req.model = body.value("model", config_.model_name);
         req.max_output = body.value("max_tokens",
                          body.value("max_output_tokens",
@@ -274,7 +302,8 @@ bool HttpServer::route_request(int fd, const HttpRequest & hr) {
                     } else if (m.contains("content") && m["content"].is_array()) {
                         // Multi-part content (text parts only for now).
                         for (const auto & part : m["content"]) {
-                            if (part.value("type", "") == "text") {
+                            std::string ptype = part.value("type", "");
+                            if (ptype == "text" || ptype == "input_text") {
                                 cm.content += part.value("text", "");
                             }
                         }
@@ -760,9 +789,14 @@ bool HttpServer::read_http_request(int fd, HttpRequest & out) {
     out.method = line.substr(0, sp1);
     out.path = line.substr(sp1 + 1, sp2 - sp1 - 1);
 
-    // Strip query string from path.
+    // Separate query string from path.
+    std::string query_string;
     size_t q = out.path.find('?');
-    if (q != std::string::npos) out.path = out.path.substr(0, q);
+    if (q != std::string::npos) {
+        query_string = out.path.substr(q + 1);
+        out.path = out.path.substr(0, q);
+    }
+    out.query = std::move(query_string);
 
     // Find Content-Length.
     long content_length = 0;
