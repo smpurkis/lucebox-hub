@@ -160,6 +160,7 @@ struct Gemma4Cache {
     int n_layer  = 0;
     int swa_size = 0;   // ring-buffer size for SWA layers (= sliding_window)
     int fa_window = 0;  // sparse decode window for full-attn layers (0 = full)
+    int32_t last_tok = -1;  // argmax of last prefill token (for spec-decode entry)
 
     // Only layers where has_kv[il] == true have real K/V tensors.
     // KV-reuse layers reference an earlier layer's cache.
@@ -167,13 +168,27 @@ struct Gemma4Cache {
     std::vector<ggml_tensor *> v;
     std::vector<int>           kv_source;  // for each layer, which layer's KV to use
 
+    // DFlash feature capture ring buffer (BF16, allocated when draft is active)
+    ggml_tensor *         target_feat = nullptr;  // [fc_in, target_feat_cap]
+    int                   target_feat_cap = 0;
+    int                   n_capture_layers = 0;
+    std::vector<int>      capture_layer_ids;
+
     ggml_context *        ctx = nullptr;
     ggml_backend_buffer_t buf = nullptr;
+
+    // Separate context/buffer for target_feat (allocated after draft load)
+    ggml_context *        feat_ctx = nullptr;
+    ggml_backend_buffer_t feat_buf = nullptr;
 };
 
 bool  create_gemma4_cache(ggml_backend_t backend, const Gemma4Weights & w,
                            int max_ctx, Gemma4Cache & out);
 void  free_gemma4_cache(Gemma4Cache & c);
+
+// Allocate target_feat ring buffer (call after draft load determines n_capture_layers).
+bool  create_gemma4_target_feat(ggml_backend_t backend, Gemma4Cache & cache,
+                                 int n_capture_layers, int hidden_size, int cap);
 
 // Snapshot
 struct Gemma4Snapshot {

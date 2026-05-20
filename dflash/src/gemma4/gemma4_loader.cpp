@@ -421,10 +421,55 @@ bool create_gemma4_cache(ggml_backend_t backend, const Gemma4Weights & w,
 }
 
 void free_gemma4_cache(Gemma4Cache & c) {
+    if (c.feat_buf) { ggml_backend_buffer_free(c.feat_buf); c.feat_buf = nullptr; }
+    if (c.feat_ctx) { ggml_free(c.feat_ctx); c.feat_ctx = nullptr; }
+    c.target_feat = nullptr;
+    c.target_feat_cap = 0;
+    c.n_capture_layers = 0;
+    c.capture_layer_ids.clear();
     if (c.buf) { ggml_backend_buffer_free(c.buf); c.buf = nullptr; }
     if (c.ctx) { ggml_free(c.ctx); c.ctx = nullptr; }
     c.k.clear(); c.v.clear(); c.kv_source.clear();
     c.cur_pos = 0;
+}
+
+bool create_gemma4_target_feat(ggml_backend_t backend, Gemma4Cache & cache,
+                                int n_capture_layers, int hidden_size, int cap) {
+    if (n_capture_layers <= 0 || hidden_size <= 0 || cap <= 0) return false;
+
+    // Free existing feat allocation
+    if (cache.feat_buf) { ggml_backend_buffer_free(cache.feat_buf); cache.feat_buf = nullptr; }
+    if (cache.feat_ctx) { ggml_free(cache.feat_ctx); cache.feat_ctx = nullptr; }
+
+    ggml_init_params ip{};
+    ip.mem_size = ggml_tensor_overhead() * 4 + 4096;
+    ip.no_alloc = true;
+    cache.feat_ctx = ggml_init(ip);
+    if (!cache.feat_ctx) return false;
+
+    const int fc_in = n_capture_layers * hidden_size;
+    cache.target_feat = ggml_new_tensor_2d(cache.feat_ctx, GGML_TYPE_BF16, fc_in, cap);
+    ggml_set_name(cache.target_feat, "gemma4_target_feat");
+
+    cache.feat_buf = ggml_backend_alloc_ctx_tensors(cache.feat_ctx, backend);
+    if (!cache.feat_buf) {
+        ggml_free(cache.feat_ctx); cache.feat_ctx = nullptr;
+        cache.target_feat = nullptr;
+        return false;
+    }
+
+    cache.target_feat_cap = cap;
+    cache.n_capture_layers = n_capture_layers;
+
+    // Compute capture layer IDs (evenly spaced across layers)
+    cache.capture_layer_ids.resize(n_capture_layers);
+    const int n_layer = cache.n_layer;
+    const int step = std::max(1, (n_layer - 2) / (n_capture_layers - 1));
+    for (int k = 0; k < n_capture_layers; k++) {
+        cache.capture_layer_ids[k] = 1 + k * step;
+    }
+
+    return true;
 }
 
 void free_gemma4_snapshot(Gemma4Snapshot & s) {

@@ -88,10 +88,13 @@ std::unique_ptr<ModelBackend> create_backend(const BackendArgs & args) {
 
     } else if (arch == "gemma4") {
         Gemma4BackendConfig gcfg;
-        gcfg.model_path = args.model_path;
-        gcfg.device     = args.device;
-        gcfg.stream_fd  = args.stream_fd;
-        gcfg.chunk      = args.chunk;
+        gcfg.model_path    = args.model_path;
+        gcfg.draft_path    = args.draft_path;
+        gcfg.draft_gpu     = args.draft_gpu;
+        gcfg.draft_ctx_max = args.draft_ctx_max;
+        gcfg.device        = args.device;
+        gcfg.stream_fd     = args.stream_fd;
+        gcfg.chunk         = args.chunk;
 
         auto backend = std::make_unique<Gemma4Backend>(gcfg);
         if (!backend->init()) {

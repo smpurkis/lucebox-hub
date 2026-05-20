@@ -14,12 +14,17 @@ Gemma4DFlashTarget::Gemma4DFlashTarget(
         Gemma4Cache & cache,
         ggml_backend_t backend)
     : w_(w), cache_(cache), backend_(backend) {
-    // Evenly-spaced capture layer IDs (same formula as qwen35 loader).
-    const int N = DFLASH27B_DRAFT_N_TARGET_LAYERS;
-    capture_ids_.resize(N);
-    const int step = std::max(1, (w.n_layer - 2) / (N - 1));
-    for (int k = 0; k < N; k++) {
-        capture_ids_[k] = 1 + k * step;
+    // Use capture layer IDs from cache (computed when target_feat is allocated)
+    if (!cache.capture_layer_ids.empty()) {
+        capture_ids_ = cache.capture_layer_ids;
+    } else {
+        // Fallback: evenly-spaced (legacy path)
+        const int N = DFLASH27B_DRAFT_N_TARGET_LAYERS;
+        capture_ids_.resize(N);
+        const int step = std::max(1, (w.n_layer - 2) / (N - 1));
+        for (int k = 0; k < N; k++) {
+            capture_ids_[k] = 1 + k * step;
+        }
     }
 }
 

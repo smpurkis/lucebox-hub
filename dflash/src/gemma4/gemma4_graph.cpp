@@ -274,7 +274,8 @@ static ggml_tensor * build_gemma4_layer(
     ggml_tensor * attn_mask_swa,
     ggml_tensor * per_layer_input,  // [n_embd_per_layer, n_tokens] or nullptr
     int kv_start,
-    int n_tokens)
+    int n_tokens,
+    int capture_idx = -1)  // >=0: write to target_feat at this capture slot
 {
     const Gemma4Layer & L = w.layers[il];
 
@@ -333,6 +334,43 @@ static ggml_tensor * build_gemma4_layer(
     // Output scale
     if (L.out_scale) {
         cur = ggml_mul(ctx, cur, L.out_scale);
+    }
+
+    // Feature capture for DFlash spec-decode
+    if (capture_idx >= 0 && cache.target_feat) {
+        const int hidden = w.n_embd;
+        const size_t elt = ggml_element_size(cache.target_feat);
+        const size_t col_stride = cache.target_feat->nb[1];
+        const int cap = cache.target_feat_cap;
+        const int slot_start = kv_start % cap;
+        const int pre_n = std::min(n_tokens, cap - slot_start);
+        const int post_n = n_tokens - pre_n;
+
+        ggml_tensor * cur_2d = ggml_reshape_2d(ctx, cur, hidden, n_tokens);
+
+        // First slice: [slot_start..slot_start+pre_n) in the ring.
+        {
+            const size_t offset =
+                (size_t)slot_start * col_stride +
+                (size_t)capture_idx * hidden * elt;
+            ggml_tensor * slot = ggml_view_2d(ctx, cache.target_feat,
+                hidden, pre_n, col_stride, offset);
+            ggml_tensor * src = ggml_view_2d(ctx, cur_2d,
+                hidden, pre_n, cur_2d->nb[1], 0);
+            ggml_build_forward_expand(gf, ggml_cpy(ctx, src, slot));
+        }
+
+        // Second slice: wrap-around at [0..post_n) if needed.
+        if (post_n > 0) {
+            const size_t offset =
+                (size_t)capture_idx * hidden * elt;
+            ggml_tensor * slot = ggml_view_2d(ctx, cache.target_feat,
+                hidden, post_n, col_stride, offset);
+            ggml_tensor * src = ggml_view_2d(ctx, cur_2d,
+                hidden, post_n, cur_2d->nb[1],
+                (size_t)pre_n * cur_2d->nb[1]);
+            ggml_build_forward_expand(gf, ggml_cpy(ctx, src, slot));
+        }
     }
 
     return cur;
@@ -432,9 +470,16 @@ bool gemma4_step(
             // Slice [n_embd_per_layer, n_tokens] for this layer
             pl_input = gemma4_view_2d_slice(ctx, per_layer_all, il);
         }
+        // Determine capture index for this layer (-1 if not a capture layer)
+        int cap_idx = -1;
+        if (cache.target_feat) {
+            for (int k = 0; k < cache.n_capture_layers; k++) {
+                if (cache.capture_layer_ids[k] == il) { cap_idx = k; break; }
+            }
+        }
         cur = build_gemma4_layer(ctx, gf, w, cache, il, cur, pp,
                                    mk_full_f16, mk_swa_f16, pl_input,
-                                   kv_start, n_tokens);
+                                   kv_start, n_tokens, cap_idx);
     }
 
     // Final norm
@@ -600,9 +645,15 @@ bool gemma4_verify_batch(
         if (per_layer_all) {
             pl_input = gemma4_view_2d_slice(ctx, per_layer_all, il);
         }
+        int cap_idx = -1;
+        if (cache.target_feat) {
+            for (int k = 0; k < cache.n_capture_layers; k++) {
+                if (cache.capture_layer_ids[k] == il) { cap_idx = k; break; }
+            }
+        }
         cur = build_gemma4_layer(ctx, gf, w, cache, il, cur, pp,
                                    mk_full_f16, mk_swa_f16, pl_input,
-                                   kv_start, n_tokens);
+                                   kv_start, n_tokens, cap_idx);
     }
 
     // Final norm
