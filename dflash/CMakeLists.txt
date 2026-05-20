@@ -215,7 +215,7 @@ add_library(dflash_common STATIC
     src/qwen35/qwen35_target_graph.cpp
     src/draft/draft_gguf_loader.cpp
     src/draft/draft_safetensors_loader.cpp
-    src/draft/draft_dflash_graph.cpp
+    src/draft/draft_graph.cpp
     src/qwen3/qwen3_drafter.cpp
     src/qwen3/qwen3_loader.cpp
     src/qwen3/qwen3_graph.cpp

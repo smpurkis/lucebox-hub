@@ -18,7 +18,7 @@ struct DraftGraphInputs {
     // hidden states. Used for DFlash integration where the draft shares the
     // target's lm_head.
     ggml_tensor * lm_head;
-    // Optional: causal mask for SWA layers [kv_pad, q_len] F32 (cast to F16 in graph).
+    // Optional: causal mask for SWA layers [kv_pad, q_len] F16.
     // nullptr = all layers non-causal.
     ggml_tensor * causal_mask_swa = nullptr;
 };
