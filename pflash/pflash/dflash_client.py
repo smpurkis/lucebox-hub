@@ -7,12 +7,20 @@ import struct
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from typing import Optional
 
 from . import config
 
 log = logging.getLogger(__name__)
+
+_READY_MARKERS = (
+    "[daemon] ready",
+    "[qwen3-daemon] ready",
+    "[laguna-daemon] ready",
+    "[gemma4-daemon] ready",
+)
 
 
 def _query_nvidia_vram_mib() -> Optional[int]:
@@ -64,6 +72,8 @@ class DflashClient:
         self.target_path = target_path
         self.draft_path = draft_path
         self.max_ctx = max_ctx
+        self._ready_event = threading.Event()
+        self._stdout_tail: list[str] = []
         env_overrides = {
             "DFLASH27B_FA_WINDOW": str(0 if fa_window is None else fa_window),
             "DFLASH27B_KV_TQ3": "1" if (kv_tq3 if kv_tq3 is not None else True) else "0",
@@ -105,14 +115,40 @@ class DflashClient:
         self._initial_hip_free_mib: int = _hip_free_mib()
         if sys.platform == "win32":
             self.proc = subprocess.Popen(cmd, stdin=subprocess.PIPE,
+                                         stdout=subprocess.PIPE,
                                          close_fds=False, env=env)
         else:
             self.proc = subprocess.Popen(cmd, stdin=subprocess.PIPE,
+                                         stdout=subprocess.PIPE,
                                          pass_fds=(self.w_pipe,), env=env)
+        self._start_stdout_reader()
         os.close(self.w_pipe)
         self._wait_until_loaded(timeout=boot_timeout_s, vram_mib=boot_vram_mib)
         # Park draft by default; user calls unpark when needed
         self._send("park draft\n")
+
+    def _start_stdout_reader(self):
+        def _reader():
+            if self.proc.stdout is None:
+                return
+            mirror_stdout = True
+            for raw in iter(self.proc.stdout.readline, b""):
+                try:
+                    line = raw.decode(errors="replace")
+                except AttributeError:
+                    line = str(raw)
+                self._stdout_tail.append(line.rstrip())
+                del self._stdout_tail[:-20]
+                if any(marker in line for marker in _READY_MARKERS):
+                    self._ready_event.set()
+                if mirror_stdout:
+                    try:
+                        sys.stdout.write(line)
+                        sys.stdout.flush()
+                    except (BrokenPipeError, OSError, ValueError):
+                        mirror_stdout = False
+
+        threading.Thread(target=_reader, name="dflash-daemon-stdout", daemon=True).start()
 
     def _read_vram_used_mib(self) -> Optional[int]:
         """GPU memory allocated since daemon spawn, in MiB.
@@ -146,33 +182,33 @@ class DflashClient:
         return _query_nvidia_vram_mib()
 
     def _wait_until_loaded(self, timeout: float = 60.0, vram_mib: int = 18000):
-        """Block until the daemon has consumed at least vram_mib of GPU memory.
+        """Block until the daemon emits its explicit ready banner.
 
-        On AMD unified-memory APUs (Strix Halo) vram_mib is compared against the
-        hipMemGetInfo delta from spawn, so it should be set to the expected model
-        size rather than absolute used VRAM.  Pass boot_vram_mib=13000 for a 27B
-        Q4_K_M model on gfx1151.
+        The memory telemetry helpers are kept for diagnostics, but readiness is
+        driven by the daemon state rather than by GPU memory usage. This avoids
+        false timeouts when the first GPU does not host the target model.
         """
         boot = time.time()
         while time.time() - boot < timeout:
-            time.sleep(1)
-            if self.proc.poll() is not None:
-                raise RuntimeError(
-                    "dflash daemon exited before weights finished loading. "
-                    "Check the daemon's stderr.")
-            used = self._read_vram_used_mib()
-            if used is None:
-                # No GPU telemetry available — wait a few seconds then assume OK.
-                if time.time() - boot >= min(timeout, 5.0):
-                    log.warning(
-                        "no GPU memory telemetry; assuming daemon loaded since "
-                        "the process is still alive")
-                    return
-            elif used >= vram_mib:
+            if self._ready_event.wait(timeout=0.1):
                 return
+            if self.proc.poll() is not None:
+                tail = "\n".join(self._stdout_tail[-10:])
+                detail = f"\nLast daemon stdout:\n{tail}" if tail else ""
+                raise RuntimeError(
+                    "dflash daemon exited before it emitted a ready banner. "
+                    "Check the daemon's stderr." + detail)
+            time.sleep(0.9)
+        tail = "\n".join(self._stdout_tail[-10:])
+        stdout_detail = f"\nLast daemon stdout:\n{tail}" if tail else ""
+        last_used = self._read_vram_used_mib()
+        memory_detail = (
+            f" Last observed GPU memory signal: {last_used} MiB "
+            f"(legacy threshold was {vram_mib} MiB)."
+            if last_used is not None else "")
         raise RuntimeError(
-            f"dflash daemon failed to load target weights within {timeout:.0f}s "
-            f"(expected memory delta > {vram_mib} MiB). Check the daemon's stderr.")
+            f"dflash daemon did not emit a ready banner within {timeout:.0f}s."
+            f"{memory_detail} Check the daemon's stderr." + stdout_detail)
 
     def _send(self, cmd: str):
         self.proc.stdin.write(cmd.encode())
