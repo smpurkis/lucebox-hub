@@ -61,12 +61,6 @@ DraftGraphOutputs build_draft_graph(
     // ── 2. Decoder layers
     ggml_tensor * h = in.noise_embed;  // [hidden, q_len, 1]
 
-    // Pre-cast causal mask to F16 (flash_attn_ext requires F16 mask)
-    ggml_tensor * mask_f16 = nullptr;
-    if (in.causal_mask_swa) {
-        mask_f16 = ggml_cast(ctx, in.causal_mask_swa, GGML_TYPE_F16);
-    }
-
     for (int il = 0; il < w.n_layer; il++) {
         const DraftLayer & L = w.layers[il];
 
@@ -143,7 +137,7 @@ DraftGraphOutputs build_draft_graph(
 
         // ── 2f. Attention: causal for SWA layers, non-causal for full layers.
         const float scale = 1.0f / std::sqrt((float)head_dim);
-        ggml_tensor * mask = (L.is_swa && mask_f16) ? mask_f16 : nullptr;
+        ggml_tensor * mask = (L.is_swa && in.causal_mask_swa) ? in.causal_mask_swa : nullptr;
         ggml_tensor * attn = ggml_flash_attn_ext(ctx, Q, K, V, mask,
                                                  scale, /*max_bias=*/0.0f,
                                                  /*logit_softcap=*/0.0f);

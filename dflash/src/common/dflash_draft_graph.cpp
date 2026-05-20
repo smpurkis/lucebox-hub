@@ -4,7 +4,7 @@
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
 
-#include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <vector>
 
@@ -72,7 +72,7 @@ static bool build_draft_graph_internal(
     ggml_set_input(sg.positions_k);
 
     // Causal mask for SWA layers (if any).
-    // Shape: [kv_pad, q_len] F32; padded kv dim to MASK_KV_PAD alignment.
+    // Shape: [kv_pad, q_len] F16 (directly, no cast needed — matches attn_masks.h pattern).
     sg.attn_mask = nullptr;
     const bool has_swa = draft_has_swa_layers(dw);
     if (has_swa) {
@@ -81,7 +81,7 @@ static bool build_draft_graph_internal(
         const int eff_ctx = swa_active ? dw.swa_window : ctx_len;
         const int eff_total_k = eff_ctx + q_len;
         const int kv_pad = mask_align_up(eff_total_k, MASK_KV_PAD);
-        sg.attn_mask = ggml_new_tensor_2d(sg.ctx, GGML_TYPE_F32, kv_pad, q_len);
+        sg.attn_mask = ggml_new_tensor_2d(sg.ctx, GGML_TYPE_F16, kv_pad, q_len);
         ggml_set_name(sg.attn_mask, "causal_mask_swa");
         ggml_set_input(sg.attn_mask);
     }
@@ -168,23 +168,20 @@ bool build_draft_step(
         const int eff_total_k = eff_ctx + q_len;
         const int kv_pad = mask_align_up(eff_total_k, MASK_KV_PAD);
 
-        // Build causal mask: query at position (eff_ctx + q) can attend to
-        // key at position k if k <= eff_ctx + q.
+        // Build causal mask in F16 directly (same pattern as attn_masks.h):
         // Context keys (k < eff_ctx): always visible.
-        // Noise keys (k = eff_ctx + j): visible if j <= q.
-        std::vector<float> mask_data((size_t)kv_pad * q_len, -INFINITY);
+        // Noise keys (k = eff_ctx + j): visible if j <= q (causal).
+        static constexpr uint16_t ZERO = 0x0000;
+        static constexpr uint16_t NEG_INF = 0xFC00;
+        std::vector<uint16_t> mask_data((size_t)kv_pad * q_len, NEG_INF);
         for (int q = 0; q < q_len; q++) {
-            // All context positions are visible
-            for (int k = 0; k < eff_ctx; k++) {
-                mask_data[(size_t)q * kv_pad + k] = 0.0f;
-            }
-            // Noise positions: causal (only positions 0..q visible)
-            for (int j = 0; j <= q; j++) {
-                mask_data[(size_t)q * kv_pad + (eff_ctx + j)] = 0.0f;
-            }
+            for (int k = 0; k < eff_ctx; k++)
+                mask_data[(size_t)q * kv_pad + k] = ZERO;
+            for (int j = 0; j <= q; j++)
+                mask_data[(size_t)q * kv_pad + (eff_ctx + j)] = ZERO;
         }
         ggml_backend_tensor_set(sg.attn_mask, mask_data.data(), 0,
-                                sizeof(float) * mask_data.size());
+                                sizeof(uint16_t) * mask_data.size());
     }
 
     return true;
