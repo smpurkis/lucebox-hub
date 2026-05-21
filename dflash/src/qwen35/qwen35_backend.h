@@ -109,6 +109,10 @@ public:
 
     void shutdown() override;
 
+    // Release oversized scratch buffers (gallocr, BSA cache) between requests
+    // to prevent VRAM growth over time.
+    void release_scratch() override;
+
 private:
     // ── Configuration ────────────────────────────────────────────────
     Qwen35Config cfg_;
