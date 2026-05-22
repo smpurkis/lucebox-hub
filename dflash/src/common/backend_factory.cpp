@@ -90,7 +90,7 @@ std::unique_ptr<ModelBackend> create_backend(const BackendArgs & args) {
         Gemma4BackendConfig gcfg;
         gcfg.model_path    = args.model_path;
         gcfg.draft_path    = args.draft_path;
-        gcfg.draft_gpu     = args.draft_gpu;
+        gcfg.draft_gpu     = args.draft_device.gpu;
         gcfg.draft_ctx_max = args.draft_ctx_max;
         gcfg.device        = args.device;
         gcfg.stream_fd     = args.stream_fd;
