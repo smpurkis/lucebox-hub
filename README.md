@@ -40,16 +40,17 @@ Each directory is self-contained with setup instructions and benchmark notes.
 
 ## Supported models
 
-All speedups measured vs vendored llama.cpp (`-fa 1`, matching KV quant).
+All speedups measured vs vendored llama.cpp (`-fa 1`, matching KV quant). Combined = geometric mean √(TTFT × decode), shown only when both phases were benched. GPU-specific numbers in the table below.
 
-| GPU | Model | TTFT speedup | Decode speedup |
-|-----|-------|:------------:|:--------------:|
-| RTX 3090 | Qwen 3.5-0.8B (Megakernel) | — | **~2×** vs F16 |
-| RTX 3090 | Qwen 3.5-27B Q4_K_M (DFlash + DDTree) | — | **3.43×** vs AR |
-| RTX 3090 | Qwen 3.6-27B Q4_K_M (DFlash + PFlash) | **10.4×** @ 128K | **~3×** vs AR |
-| RTX 3090 | Laguna-XS.2 33B-A3B Q4_K_M (DFlash + PFlash) | **5.4×** @ 128K | AR (draft pending) |
-| RTX 5090 | Qwen 3.6-27B Q4_K_M (DFlash + DDTree) | — | **4.84×** vs AR (205 tok/s) |
-| Ryzen AI MAX+ 395 (gfx1151) | Qwen 3.5-27B Q4_K_M (DFlash + PFlash, HIP) | **2.24×** @ 16K | **3.08×** vs llama.cpp HIP AR (37 tok/s) |
+| Model | TTFT | Decode | Combined |
+|-------|:----:|:------:|:--------:|
+| Qwen 3.5-0.8B (Megakernel) | — | **~2×** vs F16 | — |
+| Qwen 3.5-27B Q4_K_M (DFlash + DDTree) | — | **3.43×** vs AR | — |
+| Qwen 3.6-27B Q4_K_M (DFlash + PFlash) | **10.4×** @ 128K | **~3×** vs AR | **~5.6×** |
+| Qwen 3.6-27B Q4_K_M (DFlash + DDTree) | — | **4.84×** vs AR | — |
+| Laguna-XS.2 33B-A3B Q4_K_M (DFlash + PFlash) | **5.4×** @ 128K | AR (draft pending) | — |
+| Qwen 3.5-27B Q4_K_M (DFlash + PFlash, HIP) | **2.24×** @ 16K | **3.08×** vs llama.cpp HIP AR | **~2.6×** |
+| Gemma-4-26B-A4B Q4_K_M (DFlash) | — | **1.31×** vs llama.cpp | — |
 
 ## Client harnesses
 
