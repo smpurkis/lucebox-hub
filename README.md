@@ -55,9 +55,7 @@ All speedups measured vs vendored llama.cpp (`-fa 1`, matching KV quant). Combin
 
 ## Supported Harnesses
 
-<p align="left">
-  <a href="harness/"><img src="harness/assets/hero.png" alt="Lucebox client harness experiments on RTX 3090" width="320" align="left" /></a>
-</p>
+<a href="harness/"><img src="harness/assets/hero.png" alt="Lucebox client harness experiments on RTX 3090" width="320" /></a>
 
 [`harness/`](harness/) contains RTX 3090 client launchers and regression tests
 for Lucebox server compatibility. Run Lucebox inside Claude Code, Codex,
