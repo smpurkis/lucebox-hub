@@ -204,22 +204,7 @@ bool pipelined_decode_one_token(
     ggml_backend_t cpu_be = hybrid.cpu_backend;
 
     if (tel) {
-        tel->total_us = 0;
-        tel->prefn_graph_build_us = 0;
-        tel->prefn_compute_us = 0;
-        tel->routing_readback_us = 0;
-        tel->ffn_us = 0;
-        tel->ffn_allhot_us = 0;
-        tel->ffn_mixed_us = 0;
-        tel->gpu_idle_us = 0;
-        tel->tensor_io_us = 0;
-        tel->combine_overhead_us = 0;
-        tel->cold_cpu_us = 0;
-        tel->sync_wait_us = 0;
-        tel->allhot_layers = 0;
-        tel->mixed_layers = 0;
-        tel->total_layers = 0;
-        tel->routed_ffn_layers = 0;
+        *tel = PipelinedDecodeTelemetry{};
     }
 
     const auto tok_t0 = PipelineClock::now();
@@ -251,7 +236,9 @@ bool pipelined_decode_one_token(
             ggml_backend_graph_compute_async(backend, cpg.gf);
 
             // 3. Sync to read routing decisions from prefn output
+            const auto sync_t0 = PipelineClock::now();
             ggml_backend_synchronize(backend);
+            const auto sync_t1 = PipelineClock::now();
 
             // Read routing decisions from GPU
             int32_t global_ids[8];
@@ -260,11 +247,13 @@ bool pipelined_decode_one_token(
                                     sizeof(int32_t) * (size_t)n_expert_used);
             ggml_backend_tensor_get(cpg.moe_weights, router_weights, 0,
                                     sizeof(float) * (size_t)n_expert_used);
+            const auto readback_t1 = PipelineClock::now();
 
             // CPU-side local ID mapping + cold masking (trivial: 8 lookups + 8 mults)
             auto & storage = hybrid.layers[(size_t)il];
             int32_t local_ids[8];
             float   masked_weights[8];
+            int layer_cold_hits = 0;
             for (int i = 0; i < n_expert_used; ++i) {
                 int32_t gid = global_ids[i];
                 int32_t lid = (gid >= 0 && gid < (int)storage.hot_local_by_global.size())
@@ -275,8 +264,10 @@ bool pipelined_decode_one_token(
                 } else {
                     local_ids[i] = 0;       // safe: maps to expert 0 (result zeroed by weight)
                     masked_weights[i] = 0.0f; // cold expert contributes nothing
+                    layer_cold_hits++;
                 }
             }
+            const auto remap_t1 = PipelineClock::now();
 
             // Upload pre-computed inputs to rffn graph (H→D async on compute stream)
             ggml_backend_tensor_set_async(backend, rffn.ids, local_ids, 0,
@@ -311,6 +302,13 @@ bool pipelined_decode_one_token(
 
             if (tel) {
                 tel->prefn_compute_us += pipe_elapsed_us(prefn_compute_t0, PipelineClock::now());
+                tel->routed_prefn_us += pipe_elapsed_us(prefn_compute_t0, sync_t0);
+                tel->routed_sync_us += pipe_elapsed_us(sync_t0, sync_t1);
+                tel->routed_readback_us += pipe_elapsed_us(sync_t1, readback_t1);
+                tel->routed_cpu_remap_us += pipe_elapsed_us(readback_t1, remap_t1);
+                tel->routed_ffn_dispatch_us += pipe_elapsed_us(remap_t1, PipelineClock::now());
+                tel->routed_cold_expert_hits += layer_cold_hits;
+                tel->routed_total_expert_slots += n_expert_used;
                 tel->allhot_layers++;
                 tel->total_layers++;
                 tel->routed_ffn_layers++;
@@ -549,9 +547,11 @@ bool pipelined_decode_one_token(
 
     // Sync the compute stream before returning — caller needs act_cur on CPU.
     // All async ops (combine + copy) from the last layer must complete.
+    const auto final_sync_t0 = PipelineClock::now();
     ggml_backend_synchronize(backend);
 
     if (tel) {
+        tel->routed_final_sync_us = pipe_elapsed_us(final_sync_t0, PipelineClock::now());
         tel->total_us = pipe_elapsed_us(tok_t0, PipelineClock::now());
         // GPU idle = time in tensor I/O + routing readback + combine overhead
         // (these are all periods where GPU compute stream is idle)

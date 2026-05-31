@@ -79,6 +79,16 @@ struct PipelinedDecodeTelemetry {
     int total_layers = 0;
     int hot_graph_rebuilds = 0;     // count of hot graph rebuilds
     int routed_ffn_layers = 0;      // layers handled by routed FFN (async pipeline)
+
+    // ── Routed path breakdown (StreamMoE fast path) ──
+    uint64_t routed_prefn_us = 0;       // prefn graph compute (async dispatch + sync)
+    uint64_t routed_sync_us = 0;        // GPU sync stall waiting for prefn
+    uint64_t routed_readback_us = 0;    // D2H readback of routing IDs + weights
+    uint64_t routed_cpu_remap_us = 0;   // CPU-side local ID mapping + cold masking
+    uint64_t routed_ffn_dispatch_us = 0;// FFN graph dispatch + combine (async)
+    uint64_t routed_final_sync_us = 0;  // final sync at end of token (if measured)
+    int routed_cold_expert_hits = 0;    // experts masked (weight=0) in routed path
+    int routed_total_expert_slots = 0;  // total expert slots processed
 };
 
 // State for pipelined decode: holds cached DeltaNet pre-FFN graphs +

@@ -288,6 +288,15 @@ bool Qwen35MoeBackend::run_pipelined_decode_path(int committed, int n_gen,
     std::vector<float> logits_buf((size_t)vocab);
     std::vector<float> act_cur((size_t)hidden);
 
+    // Telemetry accumulators for the full decode loop
+    using DecodeClock = std::chrono::steady_clock;
+    uint64_t tel_embed_us = 0;
+    uint64_t tel_layers_us = 0;
+    uint64_t tel_logits_us = 0;
+    uint64_t tel_sample_us = 0;
+    PipelinedDecodeTelemetry tel_layers_accum{};
+    int tel_n_tokens = 0;
+
     // Persistent logits graph (built once, reused per token)
     StepGraph logits_sg;
     auto project_logits = [&]() -> bool {
@@ -313,7 +322,7 @@ bool Qwen35MoeBackend::run_pipelined_decode_path(int committed, int n_gen,
         }
         // GPU→GPU: pipe act_cur directly into logits graph (no host bounce)
         ggml_backend_tensor_copy_async(target_backend(), target_backend(),
-                                        pipe_state_->gpu_state.act_cur, logits_sg.hidden_input);
+                                       pipe_state_->gpu_state.act_cur, logits_sg.hidden_input);
         auto st = ggml_backend_graph_compute(target_backend(), logits_sg.gf);
         if (st != GGML_STATUS_SUCCESS) return false;
         ggml_backend_tensor_get(logits_sg.logits, logits_buf.data(), 0, sizeof(float) * (size_t)vocab);
@@ -328,7 +337,7 @@ bool Qwen35MoeBackend::run_pipelined_decode_path(int committed, int n_gen,
             ggml_backend_tensor_get(target_step_graph().logits, logits_buf.data(),
                                     prefill_logits_offset(), sizeof(float) * (size_t)vocab);
             first_tok = sample_logits(logits_buf.data(), vocab, sampler_config(),
-                                      out_tokens, sampler_rng_engine());
+                                     out_tokens, sampler_rng_engine());
         } else {
             first_tok = target_cache().last_tok;
         }
@@ -345,29 +354,36 @@ bool Qwen35MoeBackend::run_pipelined_decode_path(int committed, int n_gen,
     }
 
     for (int step = 1; step < n_gen; ++step) {
+        const auto tok_t0 = DecodeClock::now();
+
         int32_t tok = out_tokens.back();
         if (!target_weights().embedder.embed(&tok, 1, act_cur.data())) {
             return false;
         }
         ggml_backend_tensor_set_async(target_backend(), pipe_state_->gpu_state.act_cur,
-                                       act_cur.data(), 0, sizeof(float) * (size_t)hidden);
+                                      act_cur.data(), 0, sizeof(float) * (size_t)hidden);
+        const auto embed_done = DecodeClock::now();
 
+        PipelinedDecodeTelemetry tel;
         if (!pipelined_decode_one_token(*pipe_state_, target_backend(), target_weights(),
-                                        target_cache(), *target_weights().moe_hybrid,
-                                        committed, cfg_.kq_stride_pad, nullptr)) {
+                                       target_cache(), *target_weights().moe_hybrid,
+                                       committed, cfg_.kq_stride_pad,
+                                       hybrid_telemetry_ ? &tel : nullptr)) {
             return false;
         }
+        const auto layers_done = DecodeClock::now();
 
         // act_cur stays on GPU — project_logits reads it via GPU→GPU copy
         if (!project_logits()) {
             step_graph_destroy(logits_sg);
             return false;
         }
+        const auto logits_done = DecodeClock::now();
 
         int32_t next_tok;
         if (sampler_config().temp > 0) {
             next_tok = sample_logits(logits_buf.data(), vocab, sampler_config(),
-                                     out_tokens, sampler_rng_engine());
+                                    out_tokens, sampler_rng_engine());
         } else {
             next_tok = 0;
             float best = logits_buf[0];
@@ -378,12 +394,106 @@ bool Qwen35MoeBackend::run_pipelined_decode_path(int committed, int n_gen,
                 }
             }
         }
+        const auto sample_done = DecodeClock::now();
+
+        if (hybrid_telemetry_) {
+            auto us = [](DecodeClock::time_point a, DecodeClock::time_point b) -> uint64_t {
+                return (uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(b - a).count();
+            };
+            tel_embed_us += us(tok_t0, embed_done);
+            tel_layers_us += us(embed_done, layers_done);
+            tel_logits_us += us(layers_done, logits_done);
+            tel_sample_us += us(logits_done, sample_done);
+            tel_n_tokens++;
+            // Accumulate per-layer telemetry
+            tel_layers_accum.total_us += tel.total_us;
+            tel_layers_accum.prefn_graph_build_us += tel.prefn_graph_build_us;
+            tel_layers_accum.prefn_compute_us += tel.prefn_compute_us;
+            tel_layers_accum.routing_readback_us += tel.routing_readback_us;
+            tel_layers_accum.ffn_us += tel.ffn_us;
+            tel_layers_accum.ffn_allhot_us += tel.ffn_allhot_us;
+            tel_layers_accum.ffn_mixed_us += tel.ffn_mixed_us;
+            tel_layers_accum.gpu_idle_us += tel.gpu_idle_us;
+            tel_layers_accum.tensor_io_us += tel.tensor_io_us;
+            tel_layers_accum.combine_overhead_us += tel.combine_overhead_us;
+            tel_layers_accum.cold_cpu_us += tel.cold_cpu_us;
+            tel_layers_accum.cold_compute_us += tel.cold_compute_us;
+            tel_layers_accum.hot_graph_build_us += tel.hot_graph_build_us;
+            tel_layers_accum.ffn_post_get_us += tel.ffn_post_get_us;
+            tel_layers_accum.sync_wait_us += tel.sync_wait_us;
+            tel_layers_accum.allhot_layers += tel.allhot_layers;
+            tel_layers_accum.mixed_layers += tel.mixed_layers;
+            tel_layers_accum.total_layers += tel.total_layers;
+            tel_layers_accum.hot_graph_rebuilds += tel.hot_graph_rebuilds;
+            tel_layers_accum.routed_ffn_layers += tel.routed_ffn_layers;
+            tel_layers_accum.routed_prefn_us += tel.routed_prefn_us;
+            tel_layers_accum.routed_sync_us += tel.routed_sync_us;
+            tel_layers_accum.routed_readback_us += tel.routed_readback_us;
+            tel_layers_accum.routed_cpu_remap_us += tel.routed_cpu_remap_us;
+            tel_layers_accum.routed_ffn_dispatch_us += tel.routed_ffn_dispatch_us;
+            tel_layers_accum.routed_final_sync_us += tel.routed_final_sync_us;
+            tel_layers_accum.routed_cold_expert_hits += tel.routed_cold_expert_hits;
+            tel_layers_accum.routed_total_expert_slots += tel.routed_total_expert_slots;
+        }
+
         out_tokens.push_back(next_tok);
         io.emit(next_tok);
         committed++;
         target_cache().cur_pos = committed;
         if (io.cancelled) break;
         if (is_eos_tok(next_tok, target_weights())) break;
+    }
+
+    // ── Print decode telemetry ──
+    if (hybrid_telemetry_ && tel_n_tokens > 0) {
+        const double total_us = (double)(tel_embed_us + tel_layers_us + tel_logits_us + tel_sample_us);
+        std::printf("[qwen35moe-ar] === AR DECODE TELEMETRY (n_tokens=%d, %.1f tok/s) ===\n",
+                    tel_n_tokens, tel_n_tokens / (total_us / 1e6));
+        std::printf("  per-token breakdown:\n");
+        std::printf("    embed=%.2fms  layers=%.2fms  logits=%.2fms  sample=%.2fms\n",
+                    tel_embed_us / 1000.0 / tel_n_tokens,
+                    tel_layers_us / 1000.0 / tel_n_tokens,
+                    tel_logits_us / 1000.0 / tel_n_tokens,
+                    tel_sample_us / 1000.0 / tel_n_tokens);
+        std::printf("  time budget: embed=%.1f%% layers=%.1f%% logits=%.1f%% sample=%.1f%%\n",
+                    100.0 * tel_embed_us / total_us,
+                    100.0 * tel_layers_us / total_us,
+                    100.0 * tel_logits_us / total_us,
+                    100.0 * tel_sample_us / total_us);
+        // Routed path breakdown (the dominant path)
+        if (tel_layers_accum.routed_ffn_layers > 0) {
+            const int rl = tel_layers_accum.routed_ffn_layers;
+            std::printf("  routed FFN path (%d layer-evals, %d cold_hits / %d slots = %.1f%% cold):\n",
+                        rl,
+                        tel_layers_accum.routed_cold_expert_hits,
+                        tel_layers_accum.routed_total_expert_slots,
+                        tel_layers_accum.routed_total_expert_slots > 0
+                            ? 100.0 * tel_layers_accum.routed_cold_expert_hits / tel_layers_accum.routed_total_expert_slots
+                            : 0.0);
+            std::printf("    per-layer avg: prefn_dispatch=%.1fus sync_stall=%.1fus readback=%.1fus remap=%.1fus ffn_dispatch=%.1fus\n",
+                        (double)tel_layers_accum.routed_prefn_us / rl,
+                        (double)tel_layers_accum.routed_sync_us / rl,
+                        (double)tel_layers_accum.routed_readback_us / rl,
+                        (double)tel_layers_accum.routed_cpu_remap_us / rl,
+                        (double)tel_layers_accum.routed_ffn_dispatch_us / rl);
+            std::printf("    total: sync_stall=%.1fms (%.1f%% of layers time)\n",
+                        tel_layers_accum.routed_sync_us / 1000.0,
+                        100.0 * tel_layers_accum.routed_sync_us / (double)tel_layers_us);
+            std::printf("    final_sync=%.1fms (%.1f%% of layers time)\n",
+                        tel_layers_accum.routed_final_sync_us / 1000.0,
+                        100.0 * tel_layers_accum.routed_final_sync_us / (double)tel_layers_us);
+        }
+        // Split path stats (if any)
+        if (tel_layers_accum.mixed_layers > 0) {
+            std::printf("  split path: mixed=%d layers, cold_cpu=%.1fms, ffn_mixed=%.1fms\n",
+                        tel_layers_accum.mixed_layers,
+                        tel_layers_accum.cold_cpu_us / 1000.0,
+                        tel_layers_accum.ffn_mixed_us / 1000.0);
+        }
+        std::printf("  split path allhot=%d layers, hot_graph_rebuilds=%d\n",
+                    tel_layers_accum.allhot_layers - tel_layers_accum.routed_ffn_layers,
+                    tel_layers_accum.hot_graph_rebuilds);
+        std::fflush(stdout);
     }
 
     step_graph_destroy(logits_sg);
@@ -781,6 +891,14 @@ GenerateResult Qwen35MoeBackend::generate(const GenerateRequest & req,
                         decode_tel_accum.total_layers += tel.total_layers;
                         decode_tel_accum.hot_graph_rebuilds += tel.hot_graph_rebuilds;
                         decode_tel_accum.routed_ffn_layers += tel.routed_ffn_layers;
+                        decode_tel_accum.routed_prefn_us += tel.routed_prefn_us;
+                        decode_tel_accum.routed_sync_us += tel.routed_sync_us;
+                        decode_tel_accum.routed_readback_us += tel.routed_readback_us;
+                        decode_tel_accum.routed_cpu_remap_us += tel.routed_cpu_remap_us;
+                        decode_tel_accum.routed_ffn_dispatch_us += tel.routed_ffn_dispatch_us;
+                        decode_tel_accum.routed_final_sync_us += tel.routed_final_sync_us;
+                        decode_tel_accum.routed_cold_expert_hits += tel.routed_cold_expert_hits;
+                        decode_tel_accum.routed_total_expert_slots += tel.routed_total_expert_slots;
                     }
 
                     // act_cur stays on GPU — compute_logits reads it via GPU→GPU copy
@@ -833,6 +951,25 @@ GenerateResult Qwen35MoeBackend::generate(const GenerateRequest & req,
                     std::printf("  hot_graph_rebuilds=%d routed_ffn_layers=%d\n",
                                 decode_tel_accum.hot_graph_rebuilds,
                                 decode_tel_accum.routed_ffn_layers);
+                    // Routed path breakdown
+                    if (decode_tel_accum.routed_ffn_layers > 0) {
+                        const int rl = decode_tel_accum.routed_ffn_layers;
+                        std::printf("  ROUTED PATH (%d layer-evals, %d cold / %d slots = %.1f%% cold):\n",
+                                    rl, decode_tel_accum.routed_cold_expert_hits,
+                                    decode_tel_accum.routed_total_expert_slots,
+                                    decode_tel_accum.routed_total_expert_slots > 0
+                                        ? 100.0 * decode_tel_accum.routed_cold_expert_hits / decode_tel_accum.routed_total_expert_slots
+                                        : 0.0);
+                        std::printf("    per-layer: prefn=%.1fus sync=%.1fus readback=%.1fus remap=%.1fus ffn_dispatch=%.1fus\n",
+                                    (double)decode_tel_accum.routed_prefn_us / rl,
+                                    (double)decode_tel_accum.routed_sync_us / rl,
+                                    (double)decode_tel_accum.routed_readback_us / rl,
+                                    (double)decode_tel_accum.routed_cpu_remap_us / rl,
+                                    (double)decode_tel_accum.routed_ffn_dispatch_us / rl);
+                        std::printf("    totals: sync_stall=%.1fms final_sync=%.1fms\n",
+                                    decode_tel_accum.routed_sync_us / 1000.0,
+                                    decode_tel_accum.routed_final_sync_us / 1000.0);
+                    }
                     if (n_dec > 0 && decode_tel_accum.total_us > 0) {
                         const double gpu_compute_us = (double)(decode_tel_accum.prefn_compute_us + decode_tel_accum.ffn_us - decode_tel_accum.cold_cpu_us);
                         const double gpu_util_pct = 100.0 * gpu_compute_us / (double)decode_tel_accum.total_us;
