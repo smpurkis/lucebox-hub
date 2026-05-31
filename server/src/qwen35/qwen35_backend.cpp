@@ -1315,6 +1315,11 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
             }
         }
 
+        // Notify observer with draft tokens for this step.
+        if (io.observer) {
+            io.observer("draft", draft_tok);
+        }
+
         // 4. Verify: snapshot KV, run target forward over draft tokens
         if (!target->snapshot_kv()) {
             step_graph_destroy(draft_sg);
@@ -1391,6 +1396,12 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
         n_generated += emitted;
         n_accept_sum += std::min(accept_n, emitted);
         n_draft_steps++;
+
+        // Notify observer with accepted tokens for this step.
+        if (io.observer) {
+            io.observer("verify", replay_tok);
+        }
+
         if (io.cancelled) break;
         if (hit_eos) break;
     }
