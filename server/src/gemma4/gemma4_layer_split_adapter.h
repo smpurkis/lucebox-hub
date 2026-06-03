@@ -36,7 +36,7 @@ struct Gemma4LayerSplitSnapshot {
 class Gemma4LayerSplitAdapter : public LayerSplitAdapter {
 public:
     explicit Gemma4LayerSplitAdapter(const Gemma4LayerSplitAdapterConfig & cfg);
-    ~Gemma4LayerSplitAdapter() override;
+    ~Gemma4LayerSplitAdapter() noexcept override;
 
     Gemma4LayerSplitAdapter(const Gemma4LayerSplitAdapter &) = delete;
     Gemma4LayerSplitAdapter & operator=(const Gemma4LayerSplitAdapter &) = delete;
@@ -47,6 +47,7 @@ public:
 
     void begin_request(const GenerateRequest & req) override;
     void reset_request_state() override;
+    int prefill_chunk_tokens() const override { return cfg_.chunk > 0 ? cfg_.chunk : 0; }
     bool prefill(const std::vector<int32_t> & prompt,
                  int base_pos, int & last_tok) override;
     bool decode_ar(int last_tok, int committed, int n_gen,

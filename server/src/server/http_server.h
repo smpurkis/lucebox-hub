@@ -18,6 +18,7 @@
 #include "prefix_cache.h"
 #include "disk_prefix_cache.h"
 #include "api_types.h"
+#include "placement/draft_residency.h"
 #include "placement/remote_draft_config.h"
 #include "common/pflash_drafter_ipc.h"
 #include "model_card.h"
@@ -149,7 +150,8 @@ struct ServerConfig {
     bool        pflash_remote_drafter = false; // use IPC drafter for mixed backends
     RemoteDraftConfig pflash_remote;        // IPC binary/work-dir for remote PFlash drafter
     bool        pflash_skip_park = false;   // skip park/unpark for >=32GB GPUs
-    bool        lazy_draft      = false;   // park decode draft when idle to save VRAM
+    bool        lazy_draft      = false;   // legacy alias for request-scoped draft residency
+    DraftResidencyPolicy draft_residency = DraftResidencyPolicy::Auto;
 
     // Disk prefix cache
     std::string disk_cache_dir;             // empty = disabled
@@ -232,13 +234,13 @@ public:
     // Signal the server to stop accepting new connections and drain.
     void shutdown();
 
-    // Async-signal-safe: only sets stopping flag and closes listen socket.
+    // Async-signal-safe: only sets the stopping flag. The accept loop polls
+    // this flag on a short timeout, so it wakes regardless of which thread the
+    // signal is delivered to. (Closing listen_fd_ here is unsafe: on Linux a
+    // close() from another thread does not wake a blocked accept(), and it
+    // races the accept loop's own close on exit.)
     void request_stop() {
         stopping_.store(true, std::memory_order_relaxed);
-        if (listen_fd_ >= 0) {
-            ::close(listen_fd_);
-            listen_fd_ = -1;
-        }
     }
 
 private:

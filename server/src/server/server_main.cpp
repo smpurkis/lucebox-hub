@@ -19,6 +19,7 @@
 #include "common/layer_split_utils.h"
 #include "common/peer_access.h"
 #include "placement/pflash_placement.h"
+#include "placement/draft_residency.h"
 
 #include "gguf.h"
 
@@ -162,6 +163,9 @@ static void print_usage(const char * prog) {
         "  --draft-ipc-bin <path>         Remote backend IPC daemon for mixed backends\n"
         "  --draft-ipc-work-dir <path>    Remote draft IPC scratch directory\n"
         "  --draft-ipc-ring-cap <N>       Remote draft feature ring capacity\n"
+        "  --draft-swa <N>                Draft sliding-window attention size (0=off; e.g.\n"
+        "                                 2048 for unsloth Qwen3.6 targets, per server/README.md.\n"
+        "                                 Env: DFLASH27B_DRAFT_SWA)\n"
         "  --target-devices <list>        Reserved layer-split devices, e.g. cuda:0,cuda:1\n"
         "  --target-layer-split <weights>  Reserved layer-split weights\n"
         "  --peer-access        Enable peer access for multi-GPU placement\n"
@@ -208,7 +212,9 @@ static void print_usage(const char * prog) {
         "  --prefill-keep-ratio <F>    Fraction of tokens to keep (default: 0.05)\n"
         "  --prefill-drafter <path>    Drafter GGUF for compression (Qwen3-0.6B)\n"
         "  --prefill-skip-park         Skip park/unpark (for >=32GB GPUs)\n"
-        "  --lazy-draft                Park decode draft when idle to save VRAM\n"
+        "  --draft-residency auto|persistent|request-scoped\n"
+        "                         Drafter lifetime policy (default: auto)\n"
+        "  --lazy-draft                Legacy alias for --draft-residency=request-scoped\n"
         "\n"
         "Disk KV cache:\n"
         "  --kv-cache-dir <path>       Directory for ondisk KV cache (enables feature)\n"
@@ -292,6 +298,8 @@ int main(int argc, char ** argv) {
                 std::fprintf(stderr, "[server] bad --target-device value (expected backend:gpu)\n");
                 return 2;
             }
+        } else if (std::strcmp(argv[i], "--draft-swa") == 0 && i + 1 < argc) {
+            bargs.draft_swa_window = std::atoi(argv[++i]);
         } else if (std::strcmp(argv[i], "--draft-device") == 0 && i + 1 < argc) {
             if (!parse_placement_device(argv[++i], bargs.draft_device)) {
                 std::fprintf(stderr, "[server] bad --draft-device value (expected backend:gpu)\n");
@@ -384,8 +392,19 @@ int main(int argc, char ** argv) {
             sconfig.pflash_drafter_path = argv[++i];
         } else if (std::strcmp(argv[i], "--prefill-skip-park") == 0) {
             sconfig.pflash_skip_park = true;
+        } else if (std::strcmp(argv[i], "--draft-residency") == 0 && i + 1 < argc) {
+            if (!parse_draft_residency_policy(argv[++i], sconfig.draft_residency)) {
+                std::fprintf(stderr,
+                    "[server] unknown --draft-residency policy: '%s' "
+                    "(expected: auto, persistent, request-scoped)\n", argv[i]);
+                print_usage(argv[0]);
+                return 1;
+            }
+            sconfig.lazy_draft =
+                (sconfig.draft_residency == DraftResidencyPolicy::RequestScoped);
         } else if (std::strcmp(argv[i], "--lazy-draft") == 0) {
             sconfig.lazy_draft = true;
+            sconfig.draft_residency = DraftResidencyPolicy::RequestScoped;
         } else if (std::strcmp(argv[i], "--chat-template-file") == 0 && i + 1 < argc) {
             const char * path = argv[++i];
             std::FILE * f = std::fopen(path, "rb");
@@ -494,9 +513,12 @@ int main(int argc, char ** argv) {
         setenv("DFLASH27B_FA_WINDOW", "0", 0);
     }
 
-    // Lazy-draft requires both prefill-drafter AND decode draft to be useful.
-    if (sconfig.lazy_draft && !(pflash_enabled && bargs.draft_path)) {
-        std::fprintf(stderr, "[server] --lazy-draft ignored: requires both --prefill-drafter and --draft\n");
+    if (sconfig.draft_residency == DraftResidencyPolicy::RequestScoped &&
+        !(pflash_enabled || bargs.draft_path)) {
+        std::fprintf(stderr,
+            "[server] --draft-residency=request-scoped ignored: requires "
+            "--prefill-compression or --draft\n");
+        sconfig.draft_residency = DraftResidencyPolicy::Auto;
         sconfig.lazy_draft = false;
     }
 
@@ -540,6 +562,13 @@ int main(int argc, char ** argv) {
                      sconfig.pflash_threshold, sconfig.pflash_keep_ratio,
                      sconfig.pflash_drafter_gpu,
                      (int)sconfig.pflash_skip_park);
+    }
+
+    // Honor DFLASH27B_DRAFT_SWA env (documented in server/README.md) when --draft-swa is absent.
+    if (bargs.draft_swa_window == 0) {
+        if (const char * e = std::getenv("DFLASH27B_DRAFT_SWA")) {
+            bargs.draft_swa_window = std::atoi(e);
+        }
     }
 
     // Create backend.
@@ -772,6 +801,8 @@ int main(int argc, char ** argv) {
         std::fprintf(stderr, "[server] │  fp_use_bsa      = %s\n", getenv("DFLASH_FP_USE_BSA") ? "ON" : "off");
         std::fprintf(stderr, "[server] │  fp_alpha        = %s\n", getenv("DFLASH_FP_ALPHA") ? getenv("DFLASH_FP_ALPHA") : "0.12 (default)");
     }
+    std::fprintf(stderr, "[server] │  draft_residency = %s\n",
+                 draft_residency_policy_name(sconfig.draft_residency));
     if (bargs.draft_path) {
         std::fprintf(stderr, "[server] │  lazy_draft      = %s\n", sconfig.lazy_draft ? "ON" : "off");
     }
