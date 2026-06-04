@@ -3,9 +3,11 @@
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 
 namespace dflash::common {
 
@@ -865,7 +867,7 @@ bool eval_moe_batched_prefill_ffn(
     return true;
 }
 
-bool eval_moe_hybrid_ffn_batched(
+static bool eval_moe_hybrid_ffn_batched_core(
     ggml_backend_t                  gpu_backend,
     ggml_backend_t                  cpu_backend,
     const MoeHybridConfig &         cfg,
@@ -1095,6 +1097,58 @@ bool eval_moe_hybrid_ffn_batched(
 }
 
 // ── GPU-Resident Residual State ──
+
+// Public entry. Workaround for a ggml-cuda/HIP defect: the MMQ mul_mat_id
+// kernel illegal-accesses on gfx1151 when the per-layer hot expert stack is
+// REDUCED (n_hot_stack < n_expert); the full-stack (all-hot) case is fine.
+// MMVQ is used instead of MMQ only when the matmul batch dim (= n_tokens) is
+// small (Q4_K AMD MMVQ-mmid cap is 4). So for reduced hot stacks we slice the
+// prefill batch into <=4-token sub-batches, routing the routed mul_mat_id
+// through the stable MMVQ path. Full stacks keep the fast single-shot MMQ.
+bool eval_moe_hybrid_ffn_batched(
+    ggml_backend_t                  gpu_backend,
+    ggml_backend_t                  cpu_backend,
+    const MoeHybridConfig &         cfg,
+    const MoeLayerDesc &            desc,
+    MoeHybridLayerStorage &         storage,
+    const float *                   cur_host,
+    const int32_t *                 selected_ids,
+    const float *                   selected_weights,
+    int                             n_tokens,
+    std::vector<float> &            out,
+    std::string *                   err,
+    ggml_gallocr_t *                p_hot_alloc,
+    ggml_gallocr_t *                p_cold_alloc) {
+    const int n_hot_stack = storage.gate_up_hot ? (int)storage.gate_up_hot->ne[2]
+                          : storage.gate_hot    ? (int)storage.gate_hot->ne[2]
+                          : 0;
+    static const int MMQ_SAFE_SUB_BATCH = 4;
+    if (n_hot_stack > 0 && n_hot_stack < cfg.n_expert && n_tokens > MMQ_SAFE_SUB_BATCH) {
+        const int n_embd = cfg.n_embd;
+        const int n_used = cfg.n_expert_used;
+        out.assign((size_t)n_embd * (size_t)n_tokens, 0.0f);
+        std::vector<float> sub_out;
+        for (int t0 = 0; t0 < n_tokens; t0 += MMQ_SAFE_SUB_BATCH) {
+            const int tc = std::min(MMQ_SAFE_SUB_BATCH, n_tokens - t0);
+            if (!eval_moe_hybrid_ffn_batched_core(
+                    gpu_backend, cpu_backend, cfg, desc, storage,
+                    cur_host + (size_t)t0 * (size_t)n_embd,
+                    selected_ids + (size_t)t0 * (size_t)n_used,
+                    selected_weights + (size_t)t0 * (size_t)n_used,
+                    tc, sub_out, err, p_hot_alloc, p_cold_alloc)) {
+                return false;
+            }
+            std::memcpy(out.data() + (size_t)t0 * (size_t)n_embd,
+                        sub_out.data(),
+                        sizeof(float) * (size_t)n_embd * (size_t)tc);
+        }
+        return true;
+    }
+    return eval_moe_hybrid_ffn_batched_core(
+        gpu_backend, cpu_backend, cfg, desc, storage,
+        cur_host, selected_ids, selected_weights, n_tokens, out, err,
+        p_hot_alloc, p_cold_alloc);
+}
 
 void ResidualCombineGraph::free() {
     if (alloc) { ggml_gallocr_free(alloc); alloc = nullptr; }
