@@ -19,6 +19,7 @@
 #include "common/layer_split_utils.h"
 #include "common/peer_access.h"
 #include "placement/pflash_placement.h"
+#include "placement/draft_residency.h"
 
 #include "gguf.h"
 
@@ -216,7 +217,9 @@ static void print_usage(const char * prog) {
         "                              10000:0.5 40000:0.2 100000:0.1\n"
         "  --prefill-drafter <path>    Drafter GGUF for compression (Qwen3-0.6B)\n"
         "  --prefill-skip-park         Skip park/unpark (for >=32GB GPUs)\n"
-        "  --lazy-draft                Park decode draft when idle to save VRAM\n"
+        "  --draft-residency auto|persistent|request-scoped\n"
+        "                         Drafter lifetime policy (default: auto)\n"
+        "  --lazy-draft                Legacy alias for --draft-residency=request-scoped\n"
         "\n"
         "PFlash upstream proxy (forward compressed prompt to a backend):\n"
         "  --prefill-upstream-base <URL>   OpenAI-compatible upstream. Compressed\n"
@@ -426,8 +429,19 @@ int main(int argc, char ** argv) {
                 sconfig.pflash_curve.push_back({tok, ratio});
             }
             std::sort(sconfig.pflash_curve.begin(), sconfig.pflash_curve.end());
+        } else if (std::strcmp(argv[i], "--draft-residency") == 0 && i + 1 < argc) {
+            if (!parse_draft_residency_policy(argv[++i], sconfig.draft_residency)) {
+                std::fprintf(stderr,
+                    "[server] unknown --draft-residency policy: '%s' "
+                    "(expected: auto, persistent, request-scoped)\n", argv[i]);
+                print_usage(argv[0]);
+                return 1;
+            }
+            sconfig.lazy_draft =
+                (sconfig.draft_residency == DraftResidencyPolicy::RequestScoped);
         } else if (std::strcmp(argv[i], "--lazy-draft") == 0) {
             sconfig.lazy_draft = true;
+            sconfig.draft_residency = DraftResidencyPolicy::RequestScoped;
         } else if (std::strcmp(argv[i], "--chat-template-file") == 0 && i + 1 < argc) {
             const char * path = argv[++i];
             std::FILE * f = std::fopen(path, "rb");
@@ -536,9 +550,12 @@ int main(int argc, char ** argv) {
         setenv("DFLASH27B_FA_WINDOW", "0", 0);
     }
 
-    // Lazy-draft requires both prefill-drafter AND decode draft to be useful.
-    if (sconfig.lazy_draft && !(pflash_enabled && bargs.draft_path)) {
-        std::fprintf(stderr, "[server] --lazy-draft ignored: requires both --prefill-drafter and --draft\n");
+    if (sconfig.draft_residency == DraftResidencyPolicy::RequestScoped &&
+        !(pflash_enabled || bargs.draft_path)) {
+        std::fprintf(stderr,
+            "[server] --draft-residency=request-scoped ignored: requires "
+            "--prefill-compression or --draft\n");
+        sconfig.draft_residency = DraftResidencyPolicy::Auto;
         sconfig.lazy_draft = false;
     }
 
@@ -832,6 +849,8 @@ int main(int argc, char ** argv) {
         std::fprintf(stderr, "[server] │  fp_use_bsa      = %s\n", getenv("DFLASH_FP_USE_BSA") ? "ON" : "off");
         std::fprintf(stderr, "[server] │  fp_alpha        = %s\n", getenv("DFLASH_FP_ALPHA") ? getenv("DFLASH_FP_ALPHA") : "0.12 (default)");
     }
+    std::fprintf(stderr, "[server] │  draft_residency = %s\n",
+                 draft_residency_policy_name(sconfig.draft_residency));
     if (bargs.draft_path) {
         std::fprintf(stderr, "[server] │  lazy_draft      = %s\n", sconfig.lazy_draft ? "ON" : "off");
     }

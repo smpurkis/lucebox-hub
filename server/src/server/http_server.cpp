@@ -349,6 +349,7 @@ json build_props_body(const ServerConfig & config,
             {"bsa_enabled",  nullptr},
             {"bsa_alpha",    nullptr},
             {"lm_head_fix",  nullptr},
+            {"draft_residency", draft_residency_policy_name(config.draft_residency)},
         };
     } else {
         const char * bsa_env = std::getenv("DFLASH_FP_USE_BSA");
@@ -374,6 +375,7 @@ json build_props_body(const ServerConfig & config,
             {"bsa_enabled",  (bsa_env != nullptr && *bsa_env && std::strcmp(bsa_env, "0") != 0)},
             {"bsa_alpha",    bsa_alpha},
             {"lm_head_fix",  (lmfix_env != nullptr && *lmfix_env && std::strcmp(lmfix_env, "0") != 0)},
+            {"draft_residency", draft_residency_policy_name(config.draft_residency)},
         };
     }
 
@@ -411,6 +413,7 @@ json build_props_body(const ServerConfig & config,
             {"kv_cache_k",      config.kv_cache_k},
             {"kv_cache_v",      config.kv_cache_v},
             {"lazy_draft",      config.lazy_draft},
+            {"draft_residency", draft_residency_policy_name(config.draft_residency)},
             {"target_sharding", config.target_sharding},
             // Prefill chunk size (bargs.chunk). Surfaced so snapshot
             // tooling captures the full config — bench consumers
@@ -1432,6 +1435,15 @@ void HttpServer::worker_loop() {
                         creq.drafter_path = config_.pflash_drafter_path;
                         creq.drafter_gpu = config_.pflash_drafter_gpu;
                         creq.skip_park = config_.pflash_skip_park;
+                        const auto pflash_residency =
+                            resolve_draft_residency_action(
+                                config_.draft_residency,
+                                DraftResidencyContext{
+                                    DraftResidencyUse::PFlashCompress,
+                                    config_.lazy_draft,
+                                    !config_.draft_path.empty(),
+                                });
+                        creq.residency_action = pflash_residency;
 
                         ModelBackend::CompressResult cresult;
                         if (config_.pflash_remote_drafter) {
@@ -1445,6 +1457,9 @@ void HttpServer::worker_loop() {
                                 cresult.ok = pflash_remote_.compress(
                                     creq.input_ids, creq.keep_ratio,
                                     cresult.compressed_ids);
+                                if (pflash_residency == DraftResidencyAction::ReleaseAfterUse) {
+                                    pflash_remote_.close();
+                                }
                             }
                         } else {
                             cresult = backend_.compress(creq);
@@ -1815,9 +1830,20 @@ void HttpServer::worker_loop() {
             return true;
         };
 
+        const auto dflash_residency =
+            resolve_draft_residency_action(
+                config_.draft_residency,
+                DraftResidencyContext{
+                    DraftResidencyUse::DFlashDecode,
+                    config_.lazy_draft,
+                    !config_.draft_path.empty(),
+                });
+
         // Run generation (with or without restore).
-        // Lazy-draft: ensure decode draft is loaded before generate.
-        if (config_.lazy_draft) {
+        // Request-scoped draft residency ensures decode draft is loaded only
+        // around the generation window, leaving room for PFlash/target state.
+        if (dflash_residency == DraftResidencyAction::ReleaseAfterUse &&
+            !config_.draft_path.empty()) {
             backend_.free_drafter();    // free pflash drafter (~1.4 GB) if loaded
             backend_.unpark("draft");   // reload decode draft (~3.3 GB)
         }
@@ -1829,8 +1855,8 @@ void HttpServer::worker_loop() {
             result = backend_.generate_with_empty_spec_fallback(gen_req, io);
         }
 
-        // Lazy-draft: park decode draft after generate to free VRAM.
-        if (config_.lazy_draft) {
+        if (dflash_residency == DraftResidencyAction::ReleaseAfterUse &&
+            !config_.draft_path.empty()) {
             backend_.park("draft");
         }
 
