@@ -678,6 +678,10 @@ bool LagunaBackend::init_hybrid_mode() {
         return false;
     }
 
+    // Stash for the Spark bootstrap rebuild (same budget + cache as this init).
+    spark_expert_budget_ = expert_budget;
+    layer_expert_bytes_  = layer_expert_bytes;
+
     // Step 4: Build placement
     MoeHybridPlacement placement;
     if (!MoeHybridPlacement::build_from_stats_with_layer_bytes(
@@ -1481,6 +1485,28 @@ GenerateResult LagunaBackend::generate_hybrid(const GenerateRequest & req,
     if (should_emit) out_io.emit(-1);
     result.ok = (result.error.empty());
     return result;
+}
+
+bool LagunaBackend::spark_wants_bootstrap() const {
+    return moe_hybrid_ && routing_stats_ && !layer_expert_bytes_.empty() && spark_expert_budget_ > 0;
+}
+
+bool LagunaBackend::spark_bootstrap_finalize(const std::string & profile_path) {
+    if (!spark_wants_bootstrap()) return false;
+    std::string err;
+    routing_stats_->save_csv(profile_path, &err);  // persist the observed routing
+    MoeHybridPlacement placement;
+    if (!MoeHybridPlacement::build_from_stats_with_layer_bytes(
+            *routing_stats_, layer_expert_bytes_, spark_expert_budget_,
+            std::min(w_.n_expert_used, w_.n_expert), placement, &err)) {
+        std::fprintf(stderr, "[spark] bootstrap placement build failed: %s\n", err.c_str());
+        return false;
+    }
+    if (!build_hybrid_storage_from_file(placement, moe_hybrid_, err)) {
+        std::fprintf(stderr, "[spark] bootstrap storage rebuild failed: %s\n", err.c_str());
+        return false;
+    }
+    return true;
 }
 
 bool LagunaBackend::build_hybrid_storage_from_file(

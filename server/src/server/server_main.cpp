@@ -17,6 +17,7 @@
 #include "common/backend_factory.h"
 #include "common/gguf_inspect.h"
 #include "common/layer_split_utils.h"
+#include "common/spark_corpus.h"
 #include "common/peer_access.h"
 #include "placement/pflash_placement.h"
 #include "placement/draft_residency.h"
@@ -807,6 +808,45 @@ int main(int argc, char ** argv) {
     clamp_tier("high",   sconfig.effort_tiers.high);
     clamp_tier("x-high", sconfig.effort_tiers.x_high);
     clamp_tier("max",    sconfig.effort_tiers.max);
+
+    // Spark day-one bootstrap: --spark with no profile yet -> warm the placement
+    // from local agent history (Claude Code + Codex) before serving so the first
+    // session is already calibrated. One-time; live traffic refines it afterward.
+    // Backends without hybrid/routing support skip this (live calibration still
+    // applies).
+    if (spark_autotune && backend->spark_wants_bootstrap()) {
+        const std::string spark_profile = std::string(bargs.model_path) + ".spark.csv";
+        std::FILE * spf = std::fopen(spark_profile.c_str(), "rb");
+        const bool spark_have_profile = (spf != nullptr);
+        if (spf) std::fclose(spf);
+        if (!spark_have_profile) {
+            auto corpus = dflash::common::spark_scrape_corpus(/*max_chunks=*/150,
+                                                              /*chunk_chars=*/2000,
+                                                              /*min_chars=*/400);
+            if (corpus.empty()) {
+                std::fprintf(stderr, "[spark] no local history found; will calibrate from live traffic\n");
+            } else {
+                std::fprintf(stderr, "[spark] bootstrapping placement from %zu local history chunks (one-time)...\n",
+                             corpus.size());
+                DaemonIO bootstrap_io;
+                size_t fed = 0;
+                for (const auto & chunk : corpus) {
+                    GenerateRequest req;
+                    req.prompt = tokenizer.encode(chunk);
+                    if (req.prompt.size() < 8) continue;
+                    req.n_gen = 1;
+                    backend->generate(req, bootstrap_io);
+                    if (++fed % 50 == 0)
+                        std::fprintf(stderr, "[spark] bootstrap %zu/%zu chunks\n", fed, corpus.size());
+                }
+                if (backend->spark_bootstrap_finalize(spark_profile))
+                    std::fprintf(stderr, "[spark] bootstrap done: placement calibrated from local history -> %s\n",
+                                 spark_profile.c_str());
+                else
+                    std::fprintf(stderr, "[spark] bootstrap produced no profile; continuing on uniform\n");
+            }
+        }
+    }
 
     // Start HTTP server.
     std::fprintf(stderr, "\n");
